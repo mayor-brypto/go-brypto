@@ -17,19 +17,19 @@
 package runtime
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/asm"
-	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -49,9 +49,6 @@ func TestDefaults(t *testing.T) {
 		t.Error("expected difficulty to be non nil")
 	}
 
-	if cfg.Time == nil {
-		t.Error("expected time to be non nil")
-	}
 	if cfg.GasLimit == 0 {
 		t.Error("didn't expect gaslimit to be zero")
 	}
@@ -107,8 +104,8 @@ func TestExecute(t *testing.T) {
 }
 
 func TestCall(t *testing.T) {
-	state, _ := state.New(common.Hash{}, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
-	address := common.HexToAddress("0x0a")
+	state, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	address := common.HexToAddress("0xaa")
 	state.SetCode(address, []byte{
 		byte(vm.PUSH1), 10,
 		byte(vm.PUSH1), 0,
@@ -163,7 +160,7 @@ func BenchmarkCall(b *testing.B) {
 }
 func benchmarkEVM_Create(bench *testing.B, code string) {
 	var (
-		statedb, _ = state.New(common.Hash{}, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
+		statedb, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 		sender     = common.BytesToAddress([]byte("sender"))
 		receiver   = common.BytesToAddress([]byte("receiver"))
 	)
@@ -175,7 +172,7 @@ func benchmarkEVM_Create(bench *testing.B, code string) {
 		State:       statedb,
 		GasLimit:    10000000,
 		Difficulty:  big.NewInt(0x200000),
-		Time:        new(big.Int).SetUint64(0),
+		Time:        0,
 		Coinbase:    common.Address{},
 		BlockNumber: new(big.Int).SetUint64(1),
 		ChainConfig: &params.ChainConfig{
@@ -214,6 +211,70 @@ func BenchmarkEVM_CREATE_1200(bench *testing.B) {
 func BenchmarkEVM_CREATE2_1200(bench *testing.B) {
 	// initcode size 1200K, repeatedly calls CREATE2 and then modifies the mem contents
 	benchmarkEVM_Create(bench, "5b5862124f80600080f5600152600056")
+}
+
+func BenchmarkEVM_SWAP1(b *testing.B) {
+	// returns a contract that does n swaps (SWAP1)
+	swapContract := func(n uint64) []byte {
+		contract := []byte{
+			byte(vm.PUSH0), // PUSH0
+			byte(vm.PUSH0), // PUSH0
+		}
+		for i := uint64(0); i < n; i++ {
+			contract = append(contract, byte(vm.SWAP1))
+		}
+		return contract
+	}
+
+	state, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	contractAddr := common.BytesToAddress([]byte("contract"))
+
+	b.Run("10k", func(b *testing.B) {
+		contractCode := swapContract(10_000)
+		state.SetCode(contractAddr, contractCode)
+
+		for i := 0; i < b.N; i++ {
+			_, _, err := Call(contractAddr, []byte{}, &Config{State: state})
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkEVM_RETURN(b *testing.B) {
+	// returns a contract that returns a zero-byte slice of len size
+	returnContract := func(size uint64) []byte {
+		contract := []byte{
+			byte(vm.PUSH8), 0, 0, 0, 0, 0, 0, 0, 0, // PUSH8 0xXXXXXXXXXXXXXXXX
+			byte(vm.PUSH0),  // PUSH0
+			byte(vm.RETURN), // RETURN
+		}
+		binary.BigEndian.PutUint64(contract[1:], size)
+		return contract
+	}
+
+	state, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	contractAddr := common.BytesToAddress([]byte("contract"))
+
+	for _, n := range []uint64{1_000, 10_000, 100_000, 1_000_000} {
+		b.Run(strconv.FormatUint(n, 10), func(b *testing.B) {
+			b.ReportAllocs()
+
+			contractCode := returnContract(n)
+			state.SetCode(contractAddr, contractCode)
+
+			for i := 0; i < b.N; i++ {
+				ret, _, err := Call(contractAddr, []byte{}, &Config{State: state})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if uint64(len(ret)) != n {
+					b.Fatalf("expected return size %d, got %d", n, len(ret))
+				}
+			}
+		})
+	}
 }
 
 func fakeHeader(n uint64, parentHash common.Hash) *types.Header {
@@ -326,47 +387,23 @@ func TestBlockhash(t *testing.T) {
 	}
 }
 
-type stepCounter struct {
-	inner *logger.JSONLogger
-	steps int
-}
-
-func (s *stepCounter) CaptureStart(env *vm.EVM, from common.Address, to common.Address, create bool, input []byte, gas uint64, value *big.Int) {
-}
-
-func (s *stepCounter) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
-}
-
-func (s *stepCounter) CaptureEnd(output []byte, gasUsed uint64, t time.Duration, err error) {}
-
-func (s *stepCounter) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
-	s.steps++
-	// Enable this for more output
-	//s.inner.CaptureState(env, pc, op, gas, cost, memory, stack, rStack, contract, depth, err)
-}
-
 // benchmarkNonModifyingCode benchmarks code, but if the code modifies the
 // state, this should not be used, since it does not reset the state between runs.
 func benchmarkNonModifyingCode(gas uint64, code []byte, name string, tracerCode string, b *testing.B) {
 	cfg := new(Config)
 	setDefaults(cfg)
-	cfg.State, _ = state.New(common.Hash{}, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
+	cfg.State, _ = state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	cfg.GasLimit = gas
 	if len(tracerCode) > 0 {
-		tracer, err := tracers.New(tracerCode, new(tracers.Context))
+		tracer, err := tracers.DefaultDirectory.New(tracerCode, new(tracers.Context), nil, cfg.ChainConfig)
 		if err != nil {
 			b.Fatal(err)
 		}
 		cfg.EVMConfig = vm.Config{
-			Debug:  true,
-			Tracer: tracer,
+			Tracer: tracer.Hooks,
 		}
 	}
-	var (
-		destination = common.BytesToAddress([]byte("contract"))
-		vmenv       = NewEnv(cfg)
-		sender      = vm.AccountRef(cfg.Origin)
-	)
+	destination := common.BytesToAddress([]byte("contract"))
 	cfg.State.CreateAccount(destination)
 	eoa := common.HexToAddress("E0")
 	{
@@ -386,12 +423,12 @@ func benchmarkNonModifyingCode(gas uint64, code []byte, name string, tracerCode 
 	//cfg.State.CreateAccount(cfg.Origin)
 	// set the receiver's (the executing contract) code for execution.
 	cfg.State.SetCode(destination, code)
-	vmenv.Call(sender, destination, nil, gas, cfg.Value)
+	Call(destination, nil, cfg)
 
 	b.Run(name, func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			vmenv.Call(sender, destination, nil, gas, cfg.Value)
+			Call(destination, nil, cfg)
 		}
 	})
 }
@@ -399,7 +436,6 @@ func benchmarkNonModifyingCode(gas uint64, code []byte, name string, tracerCode 
 // BenchmarkSimpleLoop test a pretty simple loop which loops until OOG
 // 55 ms
 func BenchmarkSimpleLoop(b *testing.B) {
-
 	staticCallIdentity := []byte{
 		byte(vm.JUMPDEST), //  [ count ]
 		// push args for the call
@@ -478,7 +514,7 @@ func BenchmarkSimpleLoop(b *testing.B) {
 		byte(vm.JUMP),
 	}
 
-	calllRevertingContractWithInput := []byte{
+	callRevertingContractWithInput := []byte{
 		byte(vm.JUMPDEST), //
 		// push args for the call
 		byte(vm.PUSH1), 0, // out size
@@ -506,7 +542,7 @@ func BenchmarkSimpleLoop(b *testing.B) {
 	benchmarkNonModifyingCode(100000000, loopingCode, "loop-100M", "", b)
 	benchmarkNonModifyingCode(100000000, callInexistant, "call-nonexist-100M", "", b)
 	benchmarkNonModifyingCode(100000000, callEOA, "call-EOA-100M", "", b)
-	benchmarkNonModifyingCode(100000000, calllRevertingContractWithInput, "call-reverting-100M", "", b)
+	benchmarkNonModifyingCode(100000000, callRevertingContractWithInput, "call-reverting-100M", "", b)
 
 	//benchmarkNonModifyingCode(10000000, staticCallIdentity, "staticcall-identity-10M", b)
 	//benchmarkNonModifyingCode(10000000, loopingCode, "loop-10M", b)
@@ -518,12 +554,11 @@ func TestEip2929Cases(t *testing.T) {
 	t.Skip("Test only useful for generating documentation")
 	id := 1
 	prettyPrint := func(comment string, code []byte) {
-
 		instrs := make([]string, 0)
 		it := asm.NewInstructionIterator(code)
 		for it.Next() {
 			if it.Arg() != nil && 0 < len(it.Arg()) {
-				instrs = append(instrs, fmt.Sprintf("%v 0x%x", it.Op(), it.Arg()))
+				instrs = append(instrs, fmt.Sprintf("%v %#x", it.Op(), it.Arg()))
 			} else {
 				instrs = append(instrs, fmt.Sprintf("%v", it.Op()))
 			}
@@ -531,13 +566,12 @@ func TestEip2929Cases(t *testing.T) {
 		ops := strings.Join(instrs, ", ")
 		fmt.Printf("### Case %d\n\n", id)
 		id++
-		fmt.Printf("%v\n\nBytecode: \n```\n0x%x\n```\nOperations: \n```\n%v\n```\n\n",
+		fmt.Printf("%v\n\nBytecode: \n```\n%#x\n```\nOperations: \n```\n%v\n```\n\n",
 			comment,
 			code, ops)
 		Execute(code, nil, &Config{
 			EVMConfig: vm.Config{
-				Debug:     true,
-				Tracer:    logger.NewMarkdownLogger(nil, os.Stdout),
+				Tracer:    logger.NewMarkdownLogger(nil, os.Stdout).Hooks(),
 				ExtraEips: []int{2929},
 			},
 		})
@@ -690,8 +724,7 @@ func TestColdAccountAccessCost(t *testing.T) {
 		tracer := logger.NewStructLogger(nil)
 		Execute(tc.code, nil, &Config{
 			EVMConfig: vm.Config{
-				Debug:  true,
-				Tracer: tracer,
+				Tracer: tracer.Hooks(),
 			},
 		})
 		have := tracer.StructLogs()[tc.step].GasCost
@@ -699,7 +732,7 @@ func TestColdAccountAccessCost(t *testing.T) {
 			for ii, op := range tracer.StructLogs() {
 				t.Logf("%d: %v %d", ii, op.OpName(), op.GasCost)
 			}
-			t.Fatalf("tescase %d, gas report wrong, step %d, have %d want %d", i, tc.step, have, want)
+			t.Fatalf("testcase %d, gas report wrong, step %d, have %d want %d", i, tc.step, have, want)
 		}
 	}
 }
@@ -707,30 +740,30 @@ func TestColdAccountAccessCost(t *testing.T) {
 func TestRuntimeJSTracer(t *testing.T) {
 	jsTracers := []string{
 		`{enters: 0, exits: 0, enterGas: 0, gasUsed: 0, steps:0,
-	step: function() { this.steps++}, 
-	fault: function() {}, 
-	result: function() { 
-		return [this.enters, this.exits,this.enterGas,this.gasUsed, this.steps].join(",") 
-	}, 
-	enter: function(frame) { 
-		this.enters++; 
+	step: function() { this.steps++},
+	fault: function() {},
+	result: function() {
+		return [this.enters, this.exits,this.enterGas,this.gasUsed, this.steps].join(",")
+	},
+	enter: function(frame) {
+		this.enters++;
 		this.enterGas = frame.getGas();
-	}, 
-	exit: function(res) { 
-		this.exits++; 
+	},
+	exit: function(res) {
+		this.exits++;
 		this.gasUsed = res.getGasUsed();
 	}}`,
 		`{enters: 0, exits: 0, enterGas: 0, gasUsed: 0, steps:0,
-	fault: function() {}, 
-	result: function() { 
-		return [this.enters, this.exits,this.enterGas,this.gasUsed, this.steps].join(",") 
-	}, 
-	enter: function(frame) { 
-		this.enters++; 
+	fault: function() {},
+	result: function() {
+		return [this.enters, this.exits,this.enterGas,this.gasUsed, this.steps].join(",")
+	},
+	enter: function(frame) {
+		this.enters++;
 		this.enterGas = frame.getGas();
-	}, 
-	exit: function(res) { 
-		this.exits++; 
+	},
+	exit: function(res) {
+		this.exits++;
 		this.gasUsed = res.getGasUsed();
 	}}`}
 	tests := []struct {
@@ -752,7 +785,7 @@ func TestRuntimeJSTracer(t *testing.T) {
 				byte(vm.CREATE),
 				byte(vm.POP),
 			},
-			results: []string{`"1,1,952855,6,12"`, `"1,1,952855,6,0"`},
+			results: []string{`"1,1,952853,6,12"`, `"1,1,952853,6,0"`},
 		},
 		{
 			// CREATE2
@@ -768,7 +801,7 @@ func TestRuntimeJSTracer(t *testing.T) {
 				byte(vm.CREATE2),
 				byte(vm.POP),
 			},
-			results: []string{`"1,1,952846,6,13"`, `"1,1,952846,6,0"`},
+			results: []string{`"1,1,952844,6,13"`, `"1,1,952844,6,0"`},
 		},
 		{
 			// CALL
@@ -839,22 +872,22 @@ func TestRuntimeJSTracer(t *testing.T) {
 		byte(vm.PUSH1), 0,
 		byte(vm.RETURN),
 	}
-	depressedCode := []byte{
+	suicideCode := []byte{
 		byte(vm.PUSH1), 0xaa,
 		byte(vm.SELFDESTRUCT),
 	}
 	main := common.HexToAddress("0xaa")
 	for i, jsTracer := range jsTracers {
 		for j, tc := range tests {
-			statedb, _ := state.New(common.Hash{}, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
+			statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 			statedb.SetCode(main, tc.code)
 			statedb.SetCode(common.HexToAddress("0xbb"), calleeCode)
 			statedb.SetCode(common.HexToAddress("0xcc"), calleeCode)
 			statedb.SetCode(common.HexToAddress("0xdd"), calleeCode)
 			statedb.SetCode(common.HexToAddress("0xee"), calleeCode)
-			statedb.SetCode(common.HexToAddress("0xff"), depressedCode)
+			statedb.SetCode(common.HexToAddress("0xff"), suicideCode)
 
-			tracer, err := tracers.New(jsTracer, new(tracers.Context))
+			tracer, err := tracers.DefaultDirectory.New(jsTracer, new(tracers.Context), nil, params.MergedTestChainConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -862,8 +895,7 @@ func TestRuntimeJSTracer(t *testing.T) {
 				GasLimit: 1000000,
 				State:    statedb,
 				EVMConfig: vm.Config{
-					Debug:  true,
-					Tracer: tracer,
+					Tracer: tracer.Hooks,
 				}})
 			if err != nil {
 				t.Fatal("didn't expect error", err)
@@ -889,16 +921,15 @@ func TestJSTracerCreateTx(t *testing.T) {
 	exit: function(res) { this.exits++ }}`
 	code := []byte{byte(vm.PUSH1), 0, byte(vm.PUSH1), 0, byte(vm.RETURN)}
 
-	statedb, _ := state.New(common.Hash{}, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
-	tracer, err := tracers.New(jsTracer, new(tracers.Context))
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	tracer, err := tracers.DefaultDirectory.New(jsTracer, new(tracers.Context), nil, params.MergedTestChainConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _, _, err = Create(code, &Config{
 		State: statedb,
 		EVMConfig: vm.Config{
-			Debug:  true,
-			Tracer: tracer,
+			Tracer: tracer.Hooks,
 		}})
 	if err != nil {
 		t.Fatal(err)

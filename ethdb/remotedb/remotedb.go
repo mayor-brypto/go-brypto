@@ -22,9 +22,6 @@
 package remotedb
 
 import (
-	"errors"
-	"strings"
-
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -97,24 +94,24 @@ func (db *Database) Delete(key []byte) error {
 	panic("not supported")
 }
 
+func (db *Database) DeleteRange(start, end []byte) error {
+	panic("not supported")
+}
+
 func (db *Database) ModifyAncients(f func(ethdb.AncientWriteOp) error) (int64, error) {
 	panic("not supported")
 }
 
-func (db *Database) TruncateHead(n uint64) error {
+func (db *Database) TruncateHead(n uint64) (uint64, error) {
 	panic("not supported")
 }
 
-func (db *Database) TruncateTail(n uint64) error {
+func (db *Database) TruncateTail(n uint64) (uint64, error) {
 	panic("not supported")
 }
 
 func (db *Database) Sync() error {
 	return nil
-}
-
-func (db *Database) MigrateTable(s string, f func([]byte) ([]byte, error)) error {
-	panic("not supported")
 }
 
 func (db *Database) NewBatch() ethdb.Batch {
@@ -129,8 +126,8 @@ func (db *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	panic("not supported")
 }
 
-func (db *Database) Stat(property string) (string, error) {
-	panic("not supported")
+func (db *Database) Stat() (string, error) {
+	return "", nil
 }
 
 func (db *Database) AncientDatadir() (string, error) {
@@ -141,33 +138,13 @@ func (db *Database) Compact(start []byte, limit []byte) error {
 	return nil
 }
 
-func (db *Database) NewSnapshot() (ethdb.Snapshot, error) {
-	panic("not supported")
-}
-
 func (db *Database) Close() error {
 	db.remote.Close()
 	return nil
 }
 
-func dialRPC(endpoint string) (*rpc.Client, error) {
-	if endpoint == "" {
-		return nil, errors.New("endpoint must be specified")
-	}
-	if strings.HasPrefix(endpoint, "rpc:") || strings.HasPrefix(endpoint, "ipc:") {
-		// Backwards compatibility with geth < 1.5 which required
-		// these prefixes.
-		endpoint = endpoint[4:]
-	}
-	return rpc.Dial(endpoint)
-}
-
-func New(endpoint string) (ethdb.Database, error) {
-	client, err := dialRPC(endpoint)
-	if err != nil {
-		return nil, err
-	}
+func New(client *rpc.Client) ethdb.Database {
 	return &Database{
 		remote: client,
-	}, nil
+	}
 }
